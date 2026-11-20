@@ -1,4 +1,4 @@
-package com.facekioska.app;
+package com.pandagroup.attendance;
 
 import com.getcapacitor.BridgeActivity;
 
