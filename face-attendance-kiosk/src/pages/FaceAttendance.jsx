@@ -55,36 +55,54 @@ export default function FaceAttendance() {
   const isBusyRef = useRef(false);
   const lastNotFoundVoiceRef = useRef(0);
 
-  // Robust Voice speech synthesis (does NOT interrupt success voice!)
+  // Robust Voice speech synthesis (Native Android TTS inside APK + Browser fallback)
   const speakMessage = useCallback((message, isUrgent = false) => {
-    if (!VOICE_ENABLED || !window.speechSynthesis) return;
+    if (!VOICE_ENABLED) return;
 
     // If an attendance success voice is speaking, do not cut it off
     if (freezeRef.current && !isUrgent) return;
 
-    window.speechSynthesis.cancel();
-    const utterance = new SpeechSynthesisUtterance(message);
-    utterance.rate = VOICE_RATE;
-    utterance.pitch = VOICE_PITCH;
-    utterance.volume = VOICE_VOLUME;
-
-    const voices = window.speechSynthesis.getVoices();
-    if (voices.length > 0) {
-      const preferredVoice =
-        voices.find((v) => v.lang === VOICE_LANGUAGE) ||
-        voices.find((v) => v.lang.startsWith('en'));
-      if (preferredVoice) {
-        utterance.voice = preferredVoice;
+    // 1. Android Native TTS (when running inside Panda Group APK)
+    if (window.NativeTTS && typeof window.NativeTTS.speak === 'function') {
+      try {
+        window.NativeTTS.speak(message);
+        return;
+      } catch (e) {
+        console.warn('NativeTTS error:', e);
       }
     }
 
-    window.speechSynthesis.speak(utterance);
+    // 2. Browser Web Speech API fallback
+    if (window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(message);
+      utterance.rate = VOICE_RATE;
+      utterance.pitch = VOICE_PITCH;
+      utterance.volume = VOICE_VOLUME;
+
+      const voices = window.speechSynthesis.getVoices();
+      if (voices.length > 0) {
+        const preferredVoice =
+          voices.find((v) => v.lang === VOICE_LANGUAGE) ||
+          voices.find((v) => v.lang.startsWith('en'));
+        if (preferredVoice) {
+          utterance.voice = preferredVoice;
+        }
+      }
+
+      window.speechSynthesis.speak(utterance);
+    }
   }, []);
 
   // Audio chimes
   const playSuccessChime = useCallback(() => {
     try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      if (ctx.state === 'suspended') {
+        ctx.resume();
+      }
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = 'sine';
@@ -104,7 +122,12 @@ export default function FaceAttendance() {
 
   const playBuzzerSound = useCallback(() => {
     try {
-      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const AudioCtx = window.AudioContext || window.webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      if (ctx.state === 'suspended') {
+        ctx.resume();
+      }
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = 'sawtooth';

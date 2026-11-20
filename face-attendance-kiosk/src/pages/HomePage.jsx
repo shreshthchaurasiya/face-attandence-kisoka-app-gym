@@ -28,6 +28,11 @@ export default function HomePage() {
   }, []);
 
   const handleStartAttendance = () => {
+    if (window.NativeTTS && typeof window.NativeTTS.speak === 'function') {
+      try {
+        window.NativeTTS.speak('');
+      } catch (e) {}
+    }
     if (window.speechSynthesis) {
       const utterance = new SpeechSynthesisUtterance('');
       utterance.volume = 0;
