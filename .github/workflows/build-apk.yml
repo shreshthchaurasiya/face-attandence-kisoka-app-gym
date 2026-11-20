@@ -1,0 +1,54 @@
+name: Build Panda Group APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: 'npm'
+          cache-dependency-path: face-attendance-kiosk/package-lock.json
+
+      - name: Setup Java 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Install Dependencies
+        working-directory: face-attendance-kiosk
+        run: npm install
+
+      - name: Build Web Assets
+        working-directory: face-attendance-kiosk
+        run: npm run build
+
+      - name: Sync Capacitor Android
+        working-directory: face-attendance-kiosk
+        run: npx cap sync android
+
+      - name: Make Gradle executable
+        working-directory: face-attendance-kiosk/android
+        run: chmod +x ./gradlew
+
+      - name: Build APK with Gradle
+        working-directory: face-attendance-kiosk/android
+        run: ./gradlew assembleDebug --stacktrace --no-daemon
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PandaGroup-Attendance-Kiosk-APK
+          path: face-attendance-kiosk/android/app/build/outputs/apk/debug/app-debug.apk
+          retention-days: 14

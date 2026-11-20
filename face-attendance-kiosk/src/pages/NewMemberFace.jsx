@@ -1,31 +1,36 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { collection, getDocs, doc, updateDoc } from 'firebase/firestore';
 import * as faceapi from 'face-api.js';
-import { db } from '../firebase/config';
 import { useFaceApi } from '../hooks/useFaceApi';
 import { useCamera } from '../hooks/useCamera';
 import MemberSearch from '../components/MemberSearch';
 import FaceBox from '../components/FaceBox';
 import LoadingScreen from '../components/LoadingScreen';
-import { FACE_API_INPUT_SIZE } from '../utils/constants';
+import { FACE_API_INPUT_SIZE, STAFF_ROLES } from '../utils/constants';
+import { getProfiles, createProfile, saveFaceDescriptor } from '../services/api';
 import './NewMemberFace.css';
-
 
 export default function NewMemberFace() {
   const navigate = useNavigate();
   const { modelsLoaded, loadingProgress, error: modelError } = useFaceApi();
 
-  // Data State
-  const [activeTab, setActiveTab] = useState('member'); // 'member' | 'staff'
-  const [members, setMembers] = useState([]);
-  const [staffList, setStaffList] = useState([]);
-  const [dataLoading, setDataLoading] = useState(true);
-  const [dataError, setDataError] = useState(null);
+  // Mode: 'add_new' | 'search_existing'
+  const [mode, setMode] = useState('add_new');
 
-  // UI state machine: 'search' | 'camera' | 'detecting' | 'saving' | 'success' | 'error'
-  const [step, setStep] = useState('search');
-  const [selectedMember, setSelectedMember] = useState(null);
+  // New Staff Form
+  const [formData, setFormData] = useState({
+    name: '',
+    phone: '',
+    role: STAFF_ROLES[0],
+  });
+
+  // Existing Staff list
+  const [existingProfiles, setExistingProfiles] = useState([]);
+  const [dataLoading, setDataLoading] = useState(false);
+
+  // Flow step: 'form' | 'camera' | 'detecting' | 'saving' | 'success' | 'error'
+  const [step, setStep] = useState('form');
+  const [selectedProfile, setSelectedProfile] = useState(null);
   const [detection, setDetection] = useState(null);
   const [boxColor, setBoxColor] = useState('red');
   const [statusMsg, setStatusMsg] = useState('');
@@ -34,41 +39,33 @@ export default function NewMemberFace() {
   const cameraActive = step === 'camera' || step === 'detecting' || step === 'saving';
   const { videoRef, isReady, error: cameraError, stopCamera } = useCamera(cameraActive);
 
-  const canvasSize = useRef({ width: 0, height: 0 });
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
-  const intervalRef = useRef(null);
   const videoContainerRef = useRef(null);
 
-  // Load members and staff from Firestore
-  useEffect(() => {
-    async function fetchData() {
-      setDataLoading(true);
-      setDataError(null);
-      try {
-        const [memberSnap, staffSnap] = await Promise.all([
-          getDocs(collection(db, 'members')),
-          getDocs(collection(db, 'staff'))
-        ]);
-        setMembers(memberSnap.docs.map((d) => ({ id: d.id, ...d.data() })));
-        setStaffList(staffSnap.docs.map((d) => ({ id: d.id, ...d.data() })));
-      } catch (err) {
-        console.error('[Data] Fetch failed:', err);
-        setDataError(`Failed to load data: ${err.message}`);
-      } finally {
-        setDataLoading(false);
-      }
+  // Load existing staff from API
+  const loadStaff = async () => {
+    setDataLoading(true);
+    try {
+      const data = await getProfiles({ type: 'staff' });
+      setExistingProfiles(data);
+    } catch (err) {
+      console.error('Failed to load staff:', err);
+    } finally {
+      setDataLoading(false);
     }
-    fetchData();
+  };
+
+  useEffect(() => {
+    loadStaff();
   }, []);
 
-  // Update canvas dimensions when video is ready
+  // Update canvas dimensions
   useEffect(() => {
     if (isReady && videoRef.current) {
       const updateSize = () => {
         const rect = videoRef.current?.getBoundingClientRect();
         if (rect) {
           setDimensions({ width: rect.width, height: rect.height });
-          canvasSize.current = { width: rect.width, height: rect.height };
         }
       };
       updateSize();
@@ -77,13 +74,16 @@ export default function NewMemberFace() {
     }
   }, [isReady, videoRef]);
 
-  // Start face detection when camera is ready and models loaded
+  // Face Detection Loop
   useEffect(() => {
     if (!isReady || !modelsLoaded || step !== 'detecting') return;
 
-    setStatusMsg('Position your face in the frame...');
+    setStatusMsg('Position face inside the frame...');
 
-    const options = new faceapi.TinyFaceDetectorOptions({ inputSize: FACE_API_INPUT_SIZE, scoreThreshold: 0.5 });
+    const options = new faceapi.TinyFaceDetectorOptions({
+      inputSize: FACE_API_INPUT_SIZE,
+      scoreThreshold: 0.5,
+    });
 
     let isProcessing = false;
     let animationFrameId;
@@ -95,7 +95,6 @@ export default function NewMemberFace() {
       if (!isProcessing && videoRef.current && videoRef.current.readyState >= 2) {
         isProcessing = true;
         try {
-          // Detect all faces first to ensure exactly one person is in frame
           const allFaces = await faceapi.detectAllFaces(videoRef.current, options);
 
           if (!isActive) return;
@@ -107,9 +106,8 @@ export default function NewMemberFace() {
           } else if (allFaces.length > 1) {
             setDetection(null);
             setBoxColor('red');
-            setStatusMsg('Only one face at a time');
+            setStatusMsg('Only one staff member at a time');
           } else {
-            // Exactly one face, get landmarks and descriptor
             const result = await faceapi
               .detectSingleFace(videoRef.current, options)
               .withFaceLandmarks()
@@ -120,13 +118,12 @@ export default function NewMemberFace() {
             if (result) {
               setDetection(result);
               setBoxColor('green');
-              setStatusMsg('Face detected! Saving...');
+              setStatusMsg('Face detected! Saving to Hostinger Database...');
 
-              // Stop scanning and save instantly
               isActive = false;
               setStep('saving');
-              saveDescriptor(result.descriptor).catch((e) => console.error(e));
-              return; // Exit loop completely
+              handleSaveDescriptor(result.descriptor);
+              return;
             }
           }
         } catch (err) {
@@ -150,91 +147,69 @@ export default function NewMemberFace() {
     };
   }, [isReady, modelsLoaded, step]);
 
-  async function saveDescriptor(descriptor) {
-    if (!selectedMember) return;
+  // Save Descriptor Handler
+  async function handleSaveDescriptor(descriptor) {
     try {
       const descriptorArray = Array.from(descriptor);
-      const collectionName = activeTab === 'member' ? 'members' : 'staff';
-      const docRef = doc(db, collectionName, selectedMember.id);
 
-      await updateDoc(docRef, {
-        faceDescriptor: descriptorArray,
-        faceRegistered: true,
-        faceRegisteredAt: new Date().toISOString(),
-      });
-
-      // Update local data list too
-      if (activeTab === 'member') {
-        setMembers((prev) =>
-          prev.map((m) =>
-            m.id === selectedMember.id
-              ? { ...m, faceDescriptor: descriptorArray, faceRegistered: true }
-              : m
-          )
-        );
-      } else {
-        setStaffList((prev) =>
-          prev.map((s) =>
-            s.id === selectedMember.id
-              ? { ...s, faceDescriptor: descriptorArray, faceRegistered: true }
-              : s
-          )
-        );
+      if (mode === 'add_new') {
+        const created = await createProfile({
+          name: formData.name,
+          phone: formData.phone,
+          type: 'staff',
+          role: formData.role,
+          face_descriptor: descriptorArray,
+        });
+        setSelectedProfile(created);
+      } else if (selectedProfile) {
+        await saveFaceDescriptor(selectedProfile.id, descriptorArray);
       }
 
       setStep('success');
       setBoxColor('green');
-      setStatusMsg('Face ID Created Successfully!');
+      setStatusMsg('Staff Face ID Saved Successfully!');
     } catch (err) {
       console.error('[SaveDescriptor] Error:', err);
-      setPageError(`Failed to save face data: ${err.message}`);
+      setPageError(`Failed to save face: ${err.message}`);
       setStep('error');
     }
   }
 
-  function handleMemberSelect(member) {
-    setSelectedMember(member);
+  const handleAddNewSubmit = (e) => {
+    e.preventDefault();
+    if (!formData.name.trim()) {
+      alert('Please enter staff name');
+      return;
+    }
     setStep('camera');
-    setStatusMsg('');
-    setDetection(null);
-    setBoxColor('red');
-  }
+  };
 
-  function handleStartDetection() {
+  const handleSelectExisting = (profile) => {
+    setSelectedProfile(profile);
+    setStep('camera');
+  };
+
+  const handleStartDetection = () => {
     if (!modelsLoaded) {
-      setStatusMsg('Models still loading...');
+      setStatusMsg('AI models are loading, please wait...');
       return;
     }
     setStep('detecting');
-  }
+  };
 
-  function handleBack() {
-    clearInterval(intervalRef.current);
+  const handleBack = () => {
     stopCamera();
-    if (step === 'search') {
+    if (step === 'form') {
       navigate('/');
-    } else if (step === 'camera' || step === 'detecting' || step === 'saving') {
-      setStep('search');
-      setSelectedMember(null);
-      setDetection(null);
     } else {
-      setStep('search');
-      setSelectedMember(null);
+      setStep('form');
       setDetection(null);
+      setBoxColor('red');
     }
-  }
+  };
 
-  function handleRetry() {
-    setStep('camera');
-    setDetection(null);
-    setBoxColor('red');
-    setStatusMsg('');
-    setPageError(null);
-  }
-
-  // Show loading if models are loading
   if (!modelsLoaded && !modelError) {
-    return <LoadingScreen icon="🤖" message={loadingProgress} />;
+    return <LoadingScreen icon="🐼" message={loadingProgress} />;
   }
 
   if (modelError) {
@@ -248,52 +223,109 @@ export default function NewMemberFace() {
         <button id="btn-nmf-back" className="header-back-btn" onClick={handleBack}>
           ← Back
         </button>
-        <h1 className="nmf-title">
-          {step === 'search' ? 'Select Member' : 'Register Face'}
-        </h1>
+        <div className="nmf-header-text">
+          <h1 className="nmf-title">
+            {step === 'form' ? 'Staff Face ID' : 'Face Registration'}
+          </h1>
+          <p className="nmf-subtitle">Panda Ka Dhaba Staff</p>
+        </div>
         <div className="nmf-model-badge">
           {modelsLoaded ? '✓ AI Ready' : '⏳ Loading'}
         </div>
       </header>
 
-      {/* Search Step */}
-      {step === 'search' && (
-        <div className="nmf-search-container">
-          {dataError ? (
-            <div className="nmf-error-box">{dataError}</div>
-          ) : (
-            <>
-              <div className="nmf-tab-group">
-                <button
-                  className={`nmf-tab-btn ${activeTab === 'member' ? 'active' : ''}`}
-                  onClick={() => setActiveTab('member')}
-                >
-                  Member Face
-                </button>
-                <button
-                  className={`nmf-tab-btn ${activeTab === 'staff' ? 'active' : ''}`}
-                  onClick={() => setActiveTab('staff')}
-                >
-                  Staff Face
-                </button>
-              </div>
-              <p className="nmf-search-hint">
-                Search for a {activeTab} to register their face ID
+      {/* Step 1: Form & Staff List */}
+      {step === 'form' && (
+        <div className="nmf-content">
+          <div className="mode-switch-container">
+            <button
+              className={`mode-switch-btn ${mode === 'add_new' ? 'active' : ''}`}
+              onClick={() => setMode('add_new')}
+            >
+              ➕ Register New Staff
+            </button>
+            <button
+              className={`mode-switch-btn ${mode === 'search_existing' ? 'active' : ''}`}
+              onClick={() => {
+                setMode('search_existing');
+                loadStaff();
+              }}
+            >
+              🔍 Existing Staff ({existingProfiles.length})
+            </button>
+          </div>
+
+          {mode === 'add_new' ? (
+            /* Add Staff Form */
+            <div className="add-form-card">
+              <h2 className="form-card-title">Add Staff Member</h2>
+              <p className="form-card-desc">
+                Enter staff details and tap Proceed to capture face.
               </p>
+
+              <form onSubmit={handleAddNewSubmit} className="profile-form">
+                <div className="form-group">
+                  <label htmlFor="input-name">Staff Full Name *</label>
+                  <input
+                    id="input-name"
+                    type="text"
+                    placeholder="e.g. Ramesh Kumar, Sunita Devi"
+                    value={formData.name}
+                    onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                    required
+                    className="form-input"
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label htmlFor="input-phone">Mobile Number (Optional)</label>
+                  <input
+                    id="input-phone"
+                    type="tel"
+                    placeholder="e.g. 9876543210"
+                    value={formData.phone}
+                    onChange={(e) => setFormData({ ...formData, phone: e.target.value })}
+                    className="form-input"
+                  />
+                </div>
+
+                <div className="form-group">
+                  <label htmlFor="input-role">Staff Role / Designation</label>
+                  <select
+                    id="input-role"
+                    value={formData.role}
+                    onChange={(e) => setFormData({ ...formData, role: e.target.value })}
+                    className="form-select"
+                  >
+                    {STAFF_ROLES.map((role) => (
+                      <option key={role} value={role}>
+                        {role}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                <button type="submit" className="proceed-btn">
+                  📷 Proceed to Face Scan →
+                </button>
+              </form>
+            </div>
+          ) : (
+            /* Search Existing Staff */
+            <div className="search-existing-card">
               <MemberSearch
-                members={activeTab === 'member' ? members : staffList}
+                members={existingProfiles}
                 loading={dataLoading}
-                onSelect={handleMemberSelect}
+                onSelect={handleSelectExisting}
               />
-            </>
+            </div>
           )}
         </div>
       )}
 
-      {/* Camera / Detection / Saving / Success Steps */}
+      {/* Step 2: Camera & Detection */}
       {(step === 'camera' || step === 'detecting' || step === 'saving' || step === 'success') && (
         <div className="nmf-camera-container" ref={videoContainerRef}>
-          {/* Video */}
           <video
             ref={videoRef}
             className="nmf-video"
@@ -302,7 +334,6 @@ export default function NewMemberFace() {
             muted
           />
 
-          {/* Face box canvas */}
           {detection && (
             <FaceBox
               detection={detection}
@@ -313,17 +344,16 @@ export default function NewMemberFace() {
             />
           )}
 
-          {/* Camera error */}
           {cameraError && (
             <div className="camera-error-overlay">
-              <div className="camera-error-content">
-                <span className="camera-error-icon">📵</span>
-                <p>{cameraError}</p>
-              </div>
+              <span className="camera-error-icon">📵</span>
+              <p>{cameraError}</p>
+              <button className="error-retry-btn" onClick={() => setStep('form')}>
+                Back to Form
+              </button>
             </div>
           )}
 
-          {/* Loading overlay before camera ready */}
           {!isReady && !cameraError && (
             <div className="camera-loading-overlay">
               <div className="spinner-ring" />
@@ -331,26 +361,36 @@ export default function NewMemberFace() {
             </div>
           )}
 
-          {/* Start Detect button (shown when camera is ready but not yet detecting) */}
           {step === 'camera' && isReady && !cameraError && (
             <div className="nmf-start-detect-overlay">
               <div className="nmf-selected-member-chip">
-                <span className="chip-avatar">{(selectedMember.name || '?')[0]}</span>
-                <span className="chip-name">{selectedMember.name}</span>
-                <span className="chip-code">#{selectedMember.member_code || selectedMember.staff_code}</span>
+                <span className="chip-avatar">
+                  {mode === 'add_new'
+                    ? (formData.name || '?')[0].toUpperCase()
+                    : (selectedProfile?.name || '?')[0].toUpperCase()}
+                </span>
+                <div className="chip-info">
+                  <span className="chip-name">
+                    {mode === 'add_new' ? formData.name : selectedProfile?.name}
+                  </span>
+                  <span className="chip-role">
+                    {mode === 'add_new' ? formData.role : selectedProfile?.role}
+                  </span>
+                </div>
               </div>
-              <p className="nmf-detect-hint">Camera is ready. Position face in frame, then tap Detect.</p>
+              <p className="nmf-detect-hint">
+                Look straight at the camera and tap <strong>Start Face Scan</strong>.
+              </p>
               <button
                 id="btn-start-detect"
                 className="nmf-detect-btn"
                 onClick={handleStartDetection}
               >
-                📸 Detect Face
+                📸 Start Face Scan
               </button>
             </div>
           )}
 
-          {/* Status bar during detection */}
           {(step === 'detecting' || step === 'saving') && (
             <div className="nmf-status-bar">
               <div className="nmf-scan-line" />
@@ -358,46 +398,46 @@ export default function NewMemberFace() {
             </div>
           )}
 
-          {/* Success overlay */}
+          {/* Success Dialog */}
           {step === 'success' && (
             <div className="nmf-success-overlay">
               <div className="success-card">
                 <div className="success-icon-ring">
                   <span className="success-icon">✓</span>
                 </div>
-                <h2 className="success-title">Face ID Created</h2>
+                <h2 className="success-title">Face ID Saved!</h2>
+                <p className="success-sub">
+                  Saved successfully to Panda Ka Dhaba Database
+                </p>
+
                 <div className="success-member-info">
-                  <div className="success-name">{selectedMember.name}</div>
-                  <div className="success-details">
-                    <div className="success-detail">
-                      <span className="detail-lbl">{activeTab === 'member' ? 'Member Code' : 'Staff Code'}</span>
-                      <span className="detail-val">{selectedMember.member_code || selectedMember.staff_code || '—'}</span>
-                    </div>
-                    <div className="success-detail">
-                      <span className="detail-lbl">Biometric ID</span>
-                      <span className="detail-val">{selectedMember.biometric_id || '—'}</span>
-                    </div>
+                  <div className="success-name">
+                    {mode === 'add_new' ? formData.name : selectedProfile?.name}
+                  </div>
+                  <div className="success-role-badge">
+                    {mode === 'add_new' ? formData.role : selectedProfile?.role}
                   </div>
                 </div>
+
                 <div className="success-actions">
                   <button
-                    id="btn-register-another"
                     className="success-btn-secondary"
                     onClick={() => {
                       stopCamera();
-                      setStep('search');
-                      setSelectedMember(null);
+                      setStep('form');
+                      setFormData({ name: '', phone: '', role: STAFF_ROLES[0] });
+                      setSelectedProfile(null);
                       setDetection(null);
+                      loadStaff();
                     }}
                   >
-                    Register Another
+                    ➕ Add Another Staff
                   </button>
                   <button
-                    id="btn-go-home"
                     className="success-btn-primary"
-                    onClick={() => navigate('/')}
+                    onClick={() => navigate('/attendance')}
                   >
-                    Go Home
+                    📷 Start Attendance Kiosk
                   </button>
                 </div>
               </div>
@@ -406,17 +446,19 @@ export default function NewMemberFace() {
         </div>
       )}
 
-      {/* Error Step */}
+      {/* Error state */}
       {step === 'error' && (
         <div className="nmf-error-page">
-          <div className="nmf-error-content">
-            <span className="error-big-icon">⚠️</span>
-            <h2>Save Failed</h2>
-            <p>{pageError}</p>
-            <div className="error-actions">
-              <button className="btn-retry" onClick={handleRetry}>Try Again</button>
-              <button className="btn-home" onClick={() => navigate('/')}>Go Home</button>
-            </div>
+          <span className="error-big-icon">⚠️</span>
+          <h2>Enrollment Failed</h2>
+          <p>{pageError}</p>
+          <div className="error-actions">
+            <button className="btn-retry" onClick={() => setStep('camera')}>
+              Try Again
+            </button>
+            <button className="btn-home" onClick={() => navigate('/')}>
+              Go Home
+            </button>
           </div>
         </div>
       )}

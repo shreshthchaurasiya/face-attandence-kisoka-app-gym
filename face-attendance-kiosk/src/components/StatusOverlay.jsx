@@ -2,12 +2,7 @@ import React from 'react';
 import './StatusOverlay.css';
 
 /**
- * Bottom glassmorphism overlay showing member info and status message.
- *
- * @param {object} props
- * @param {object|null} props.member - Matched member data
- * @param {string} props.status - e.g. 'checking', 'checked_in', 'already_in', 'no_match', 'multi_face', 'idle'
- * @param {string} props.statusMessage - Display message
+ * Bottom glassmorphism overlay showing profile info and status message.
  */
 export default function StatusOverlay({ member, status, statusMessage }) {
   const statusClass = {
@@ -45,12 +40,12 @@ export default function StatusOverlay({ member, status, statusMessage }) {
           <div className="member-details">
             <span className="member-detail-item">
               <span className="detail-label">Code</span>
-              <span className="detail-value">{member.member_code || '—'}</span>
+              <span className="detail-value">{member.profile_code || member.member_code || member.staff_code || `#${member.id}`}</span>
             </span>
             <span className="member-detail-divider">|</span>
             <span className="member-detail-item">
-              <span className="detail-label">Bio ID</span>
-              <span className="detail-value">{member.biometric_id || '—'}</span>
+              <span className="detail-label">Role</span>
+              <span className="detail-value">{member.role || (member.type === 'staff' ? 'Staff' : 'Customer')}</span>
             </span>
             {member.status && (
               <>

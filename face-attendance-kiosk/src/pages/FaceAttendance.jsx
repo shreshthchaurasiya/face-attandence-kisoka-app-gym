@@ -1,16 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { useNavigate } from 'react-router-dom';
-import {
-  collection,
-  getDocs,
-  getDoc,
-  query,
-  where,
-  addDoc,
-  doc,
-} from 'firebase/firestore';
 import * as faceapi from 'face-api.js';
-import { db } from '../firebase/config';
 import { useFaceApi } from '../hooks/useFaceApi';
 import { useCamera } from '../hooks/useCamera';
 import FaceBox from '../components/FaceBox';
@@ -24,18 +14,23 @@ import {
   VOICE_LANGUAGE,
   VOICE_RATE,
   VOICE_PITCH,
-  VOICE_VOLUME
+  VOICE_VOLUME,
 } from '../utils/constants';
+import { getProfiles, markAttendance } from '../services/api';
 import './FaceAttendance.css';
 
 const MATCH_THRESHOLD = 0.5;
-const COOLDOWN_MS = 5000;
+const COOLDOWN_MS = 6000;
+const SUCCESS_DISPLAY_TIME_MS = 4500; // Keep screen visible for 4.5 seconds
 
 export default function FaceAttendance() {
   const navigate = useNavigate();
   const { modelsLoaded, loadingProgress, error: modelError } = useFaceApi();
 
-  // Camera
+  // Mode: 'check_in' | 'check_out'
+  const [kioskMode, setKioskMode] = useState('check_in');
+
+  // Camera state
   const [cameraActive, setCameraActive] = useState(false);
   const { videoRef, isReady, error: cameraError, stopCamera } = useCamera(cameraActive);
 
@@ -45,23 +40,27 @@ export default function FaceAttendance() {
   const [descriptorsError, setDescriptorsError] = useState(null);
   const [descriptorCount, setDescriptorCount] = useState(0);
 
-  // Detection state
+  // Detection & Kiosk state
   const [detection, setDetection] = useState(null);
   const [boxColor, setBoxColor] = useState('red');
   const [matchedMember, setMatchedMember] = useState(null);
-  const [attendanceStatus, setAttendanceStatus] = useState('idle'); // idle | checking | checked_in | already_in | no_match | multi_face | denied
-  const [statusMessage, setStatusMessage] = useState('Point camera at your face...');
-  const [denialReason, setDenialReason] = useState(null);
+  const [attendanceStatus, setAttendanceStatus] = useState('idle'); // idle | checking | checked_in | checked_out | already_in | already_out | not_checked_in | no_match | multi_face | locked
+  const [statusMessage, setStatusMessage] = useState('Position your face in front of camera...');
+  const [attendanceEvent, setAttendanceEvent] = useState(null);
 
   const [dimensions, setDimensions] = useState({ width: 0, height: 0 });
-  const cooldownMap = useRef(new Map()); // memberId -> timestamp
-  const todayAttendanceSet = useRef(new Set()); // memberId -> true
+  const cooldownMap = useRef(new Map());
+  const todayAttendanceSet = useRef(new Set());
   const freezeRef = useRef(false);
+  const isBusyRef = useRef(false);
   const lastNotFoundVoiceRef = useRef(0);
 
-  // Audio functions
-  const speakMessage = useCallback((message) => {
+  // Robust Voice speech synthesis (does NOT interrupt success voice!)
+  const speakMessage = useCallback((message, isUrgent = false) => {
     if (!VOICE_ENABLED || !window.speechSynthesis) return;
+
+    // If an attendance success voice is speaking, do not cut it off
+    if (freezeRef.current && !isUrgent) return;
 
     window.speechSynthesis.cancel();
     const utterance = new SpeechSynthesisUtterance(message);
@@ -71,7 +70,9 @@ export default function FaceAttendance() {
 
     const voices = window.speechSynthesis.getVoices();
     if (voices.length > 0) {
-      const preferredVoice = voices.find(v => v.lang === VOICE_LANGUAGE) || voices.find(v => v.lang.startsWith('en'));
+      const preferredVoice =
+        voices.find((v) => v.lang === VOICE_LANGUAGE) ||
+        voices.find((v) => v.lang.startsWith('en'));
       if (preferredVoice) {
         utterance.voice = preferredVoice;
       }
@@ -79,22 +80,26 @@ export default function FaceAttendance() {
 
     window.speechSynthesis.speak(utterance);
   }, []);
+
+  // Audio chimes
   const playSuccessChime = useCallback(() => {
     try {
       const ctx = new (window.AudioContext || window.webkitAudioContext)();
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = 'sine';
-      osc.frequency.setValueAtTime(800, ctx.currentTime);
-      osc.frequency.exponentialRampToValueAtTime(1200, ctx.currentTime + 0.1);
+      osc.frequency.setValueAtTime(600, ctx.currentTime);
+      osc.frequency.exponentialRampToValueAtTime(1000, ctx.currentTime + 0.14);
       osc.connect(gain);
       gain.connect(ctx.destination);
       osc.start();
       gain.gain.setValueAtTime(0, ctx.currentTime);
-      gain.gain.linearRampToValueAtTime(0.5, ctx.currentTime + 0.05);
-      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.5);
-      osc.stop(ctx.currentTime + 0.5);
-    } catch (e) { console.error(e); }
+      gain.gain.linearRampToValueAtTime(0.4, ctx.currentTime + 0.05);
+      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.45);
+      osc.stop(ctx.currentTime + 0.45);
+    } catch (e) {
+      console.error(e);
+    }
   }, []);
 
   const playBuzzerSound = useCallback(() => {
@@ -103,89 +108,64 @@ export default function FaceAttendance() {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = 'sawtooth';
-      osc.frequency.setValueAtTime(150, ctx.currentTime);
+      osc.frequency.setValueAtTime(160, ctx.currentTime);
       osc.connect(gain);
       gain.connect(ctx.destination);
       osc.start();
       gain.gain.setValueAtTime(0.3, ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.3);
-      osc.stop(ctx.currentTime + 0.3);
-
-      setTimeout(() => {
-        const osc2 = ctx.createOscillator();
-        const gain2 = ctx.createGain();
-        osc2.type = 'sawtooth';
-        osc2.frequency.setValueAtTime(150, ctx.currentTime);
-        osc2.connect(gain2);
-        gain2.connect(ctx.destination);
-        osc2.start();
-        gain2.gain.setValueAtTime(0.3, ctx.currentTime);
-        gain2.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.3);
-        osc2.stop(ctx.currentTime + 0.3);
-      }, 150);
-    } catch (e) { console.error(e); }
+      gain.gain.exponentialRampToValueAtTime(0.01, ctx.currentTime + 0.25);
+      osc.stop(ctx.currentTime + 0.25);
+    } catch (e) {
+      console.error(e);
+    }
   }, []);
 
-  // Start camera only after models are loaded to avoid ref race conditions
+  // Start camera after models load
   useEffect(() => {
     if (modelsLoaded && !modelError) {
       setCameraActive(true);
     }
   }, [modelsLoaded, modelError]);
 
-  // Load all face-registered members and staff
+  // Load registered staff descriptors
   const loadDescriptors = useCallback(async () => {
     setDescriptorsLoading(true);
     setDescriptorsError(null);
     try {
-      const [memberSnap, staffSnap] = await Promise.all([
-        getDocs(query(collection(db, 'members'), where('faceRegistered', '==', true))),
-        getDocs(query(collection(db, 'staff'), where('faceRegistered', '==', true)))
-      ]);
+      const profiles = await getProfiles({
+        type: 'staff',
+        registeredOnly: true,
+        includeDescriptor: true,
+      });
 
       const descriptors = [];
       let skipped = 0;
 
-      memberSnap.docs.forEach((d) => {
-        const data = d.data();
-        if (!data.faceDescriptor || !isValidDescriptor(data.faceDescriptor)) {
+      profiles.forEach((p) => {
+        let desc = p.face_descriptor;
+        if (typeof desc === 'string') {
+          try {
+            desc = JSON.parse(desc);
+          } catch {
+            desc = null;
+          }
+        }
+        if (!desc || !isValidDescriptor(desc)) {
           skipped++;
           return;
         }
         descriptors.push({
-          member: { id: d.id, ...data, profileType: 'member' },
-          descriptor: data.faceDescriptor,
+          member: {
+            id: p.id,
+            name: p.name,
+            role: p.role,
+            profile_code: p.profile_code,
+            phone: p.phone,
+            status: p.status,
+          },
+          descriptor: desc,
         });
       });
-
-      staffSnap.docs.forEach((d) => {
-        const data = d.data();
-        if (!data.faceDescriptor || !isValidDescriptor(data.faceDescriptor)) {
-          skipped++;
-          return;
-        }
-        descriptors.push({
-          member: { id: d.id, ...data, profileType: 'staff' },
-          descriptor: data.faceDescriptor,
-        });
-      });
-
-      if (skipped > 0) {
-        console.warn(`[FaceAttendance] Skipped ${skipped} profiles with invalid descriptors`);
-      }
-
-      // Also preload today's attendance to avoid querying Firebase repeatedly
-      const today = getLocalDateString();
-      const attendanceSnap = await getDocs(
-        query(collection(db, 'attendance'), where('attendance_date', '==', today))
-      );
-      const attSet = new Set();
-      attendanceSnap.docs.forEach(docSnap => {
-        const data = docSnap.data();
-        const pType = data.type === 'staff' ? 'staff' : 'member';
-        attSet.add(`${pType}_${data.member_id}_${today}`);
-      });
-      todayAttendanceSet.current = attSet;
 
       setCachedDescriptors(descriptors);
       setDescriptorCount(descriptors.length);
@@ -201,7 +181,7 @@ export default function FaceAttendance() {
     loadDescriptors();
   }, [loadDescriptors]);
 
-  // Update canvas dimensions on video ready
+  // Canvas size listener
   useEffect(() => {
     if (isReady && videoRef.current) {
       const updateSize = () => {
@@ -214,11 +194,11 @@ export default function FaceAttendance() {
     }
   }, [isReady, videoRef]);
 
-  // Main face scanning loop
+  // Main Face Attendance Scanning Loop
   useEffect(() => {
     if (!isReady || !modelsLoaded || descriptorsLoading || !cameraActive) return;
     if (cachedDescriptors.length === 0) {
-      setStatusMessage('No registered faces found. Register members first.');
+      setStatusMessage('No enrolled staff faces found. Please register staff first.');
       return;
     }
 
@@ -234,8 +214,8 @@ export default function FaceAttendance() {
     async function detectLoop() {
       if (!isActive) return;
 
-      // Skip processing if frozen, but keep loop alive
-      if (freezeRef.current) {
+      // When frozen (showing success card and speaking), DO NOT SCAN ANYTHING
+      if (freezeRef.current || isBusyRef.current) {
         animationFrameId = requestAnimationFrame(detectLoop);
         return;
       }
@@ -243,79 +223,82 @@ export default function FaceAttendance() {
       if (!isProcessing && videoRef.current && videoRef.current.readyState >= 2) {
         isProcessing = true;
         try {
-          // Detect all faces to check for multiple people
           const allDetections = await faceapi.detectAllFaces(videoRef.current, options);
 
-          if (!isActive) return;
+          if (!isActive || freezeRef.current) return;
 
           if (allDetections.length === 0) {
             setDetection(null);
             setBoxColor('red');
             setMatchedMember(null);
             setAttendanceStatus('idle');
-            setStatusMessage('Point camera at your face...');
+            setStatusMessage(
+              kioskMode === 'check_in'
+                ? '🟢 Check-In Mode: Look at camera...'
+                : '🔴 Check-Out Mode: Look at camera...'
+            );
           } else if (allDetections.length > 1) {
             setDetection(null);
             setBoxColor('red');
             setMatchedMember(null);
             setAttendanceStatus('multi_face');
-            setStatusMessage('Only one face at a time');
+            setStatusMessage('Only one staff member at a time in frame');
           } else {
-            // Single face — get full descriptor
+            // Single face detected
             const result = await faceapi
               .detectSingleFace(videoRef.current, options)
               .withFaceLandmarks()
               .withFaceDescriptor();
 
-            if (!isActive) return;
+            if (!isActive || freezeRef.current) return;
 
             if (!result) {
               setDetection(null);
               setBoxColor('red');
               setMatchedMember(null);
               setAttendanceStatus('idle');
-              setStatusMessage('Point camera at your face...');
             } else {
               setDetection(result);
               setAttendanceStatus('checking');
-              setStatusMessage('Identifying...');
+              setStatusMessage('Recognizing face...');
 
-              // Match against cache
               const match = findBestMatch(result.descriptor, cachedDescriptors, MATCH_THRESHOLD);
 
               if (!match) {
                 setBoxColor('red');
                 setMatchedMember(null);
                 setAttendanceStatus('no_match');
-                setStatusMessage('Face Not Found');
+                setStatusMessage('Face Not Recognized');
 
                 const now = Date.now();
-                if (now - lastNotFoundVoiceRef.current > 5000) {
-                  speakMessage("Face not found");
+                if (now - lastNotFoundVoiceRef.current > 5000 && !freezeRef.current) {
+                  speakMessage('Face not registered');
                   lastNotFoundVoiceRef.current = now;
                 }
               } else {
                 const { member } = match;
-
-                // Check cooldown
-                const matchKey = `${member.profileType}_${member.id}_${getLocalDateString()}`;
+                const matchKey = `${kioskMode}_${member.id}_${getLocalDateString()}`;
                 const lastSeen = cooldownMap.current.get(matchKey);
+
                 if (lastSeen && Date.now() - lastSeen < COOLDOWN_MS) {
+                  // In cooldown
                   setBoxColor('green');
                   setMatchedMember(member);
                 } else {
+                  // Lock immediately before async call!
+                  isBusyRef.current = true;
+                  freezeRef.current = true;
                   setBoxColor('green');
                   setMatchedMember(member);
-                  cooldownMap.current.set(matchKey, Date.now());
+                  cooldownMap.current.set(matchKey, Date.now() + 10000);
 
-                  // Check / create attendance record (fire and forget)
-                  handleAttendance(member).catch(e => console.error(e));
+                  handleAttendanceAction(member);
                 }
               }
             }
           }
         } catch (err) {
-          console.error('[FaceAttendance] Scan error:', err);
+          console.error('[FaceAttendance] Loop error:', err);
         } finally {
           isProcessing = false;
         }
@@ -332,220 +315,188 @@ export default function FaceAttendance() {
       isActive = false;
       if (animationFrameId) cancelAnimationFrame(animationFrameId);
     };
-  }, [isReady, modelsLoaded, descriptorsLoading, cachedDescriptors, cameraActive]);
+  }, [isReady, modelsLoaded, descriptorsLoading, cachedDescriptors, cameraActive, kioskMode]);
 
-  const handleAttendance = useCallback(async (member) => {
-    try {
-      setAttendanceStatus('checking');
-      setStatusMessage('Validating membership...');
-
-      const isStaff = member.profileType === 'staff';
-      const collectionName = isStaff ? 'staff' : 'members';
-
-      // 1. Live Fetch
-      const memberDoc = await getDoc(doc(db, collectionName, member.id));
-      if (!memberDoc.exists()) {
-        throw new Error(`${isStaff ? 'Staff' : 'Member'} profile not found`);
-      }
-      const memberData = memberDoc.data();
-      const status = memberData.status;
-
-      const duplicateKey = `${member.profileType}_${member.id}_${getLocalDateString()}`;
-
-      // Duplicate check
-      if (todayAttendanceSet.current.has(duplicateKey)) {
-        freezeRef.current = true;
-        speakMessage("Already checked in");
-        setAttendanceStatus('already_in');
-        setStatusMessage('Already Checked In Today');
-        setTimeout(() => {
-          setAttendanceStatus('idle');
-          freezeRef.current = false;
-        }, 3000);
-        return;
-      }
-
-      if (isStaff) {
-        // Validation for Staff
-        if (!status) {
-          console.warn(`[Staff] Status field missing for ${member.name} (${member.id}). Allowing attendance.`);
-        } else if (status !== 'Active') {
-          freezeRef.current = true;
-          playBuzzerSound();
-          setTimeout(() => speakMessage("Access denied"), 300);
-
-          setAttendanceStatus('denied');
-          setDenialReason({
-            title: 'ACCESS DENIED',
-            message: 'Staff Inactive',
-            detail: `Status is ${status}`,
-            memberData: { ...memberData, member_code: memberData.staff_code }
-          });
-          setTimeout(() => {
-            setAttendanceStatus('idle');
-            freezeRef.current = false;
-          }, 5000);
-          return;
-        }
-
-        // Write attendance for staff
-        const todayStr = getLocalDateString();
-        await addDoc(collection(db, 'attendance'), {
-          member_id: member.id,
-          type: "staff",
-          staff_id: member.id,
-          staff_name: memberData.name || 'Unknown',
-          staff_code: memberData.staff_code || 'N/A',
-          role: memberData.role || 'Staff',
-          attendance_date: todayStr,
-          check_in_time: new Date().toISOString(),
-          timestamp: Date.now(),
-          attendance_method: "face_kiosk_staff",
-          display_name: `STAFF ${memberData.name || 'Unknown'} (${memberData.staff_code || 'N/A'})`
+  // Handle Attendance Action (Check-In or Check-Out)
+  const handleAttendanceAction = useCallback(
+    async (member) => {
+      try {
+        setAttendanceStatus('checking');
+        const now = new Date();
+        const formattedTime = now.toLocaleTimeString('en-IN', {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: true,
         });
 
-        todayAttendanceSet.current.add(duplicateKey);
+        // ================= CHECK-OUT LOGIC =================
+        if (kioskMode === 'check_out') {
+          setStatusMessage(`Checking out ${member.name}...`);
+          const res = await markAttendance(member.id, 'check_out', 'face_kiosk');
 
-        freezeRef.current = true;
-        playSuccessChime();
-        setTimeout(() => speakMessage("Staff Attendance Done"), 300);
-
-        setAttendanceStatus('checked_in');
-        setStatusMessage('Check-In Successful! ✓');
-        setTimeout(() => {
-          setAttendanceStatus('idle');
-          freezeRef.current = false;
-        }, 3000);
-
-      } else {
-        // Validation for Member
-        const lowerStatus = (status || '').toLowerCase();
-
-        // Check 1: Must be active
-        if (lowerStatus !== 'active') {
-          freezeRef.current = true;
-          playBuzzerSound();
-          setTimeout(() => speakMessage("Access denied"), 300);
-
-          setAttendanceStatus('denied');
-          setDenialReason({
-            title: 'ACCESS DENIED',
-            message: 'Membership Inactive',
-            detail: `Status is ${status || 'Unknown'}`,
-            memberData
-          });
-          setTimeout(() => {
-            setAttendanceStatus('idle');
-            freezeRef.current = false;
-          }, 5000);
-          return;
-        }
-
-        // Check 2: Expiry Date (Allow until 23:59:59)
-        const expiryDateStr = memberData.plan_end_date || memberData.expiryDate;
-        if (expiryDateStr) {
-          const today = new Date();
-          const expiry = new Date(expiryDateStr);
-          expiry.setHours(23, 59, 59, 999);
-
-          if (today > expiry) {
-            freezeRef.current = true;
+          if (res && res.action === 'not_checked_in') {
             playBuzzerSound();
-            setTimeout(() => speakMessage("Membership expired"), 300);
+            speakMessage(`No check-in record found today for ${member.name}`, true);
+            setAttendanceStatus('not_checked_in');
+            setStatusMessage('No check-in record found for today!');
 
-            setAttendanceStatus('denied');
-            setDenialReason({
-              title: 'ACCESS DENIED',
-              message: 'Membership Expired',
-              detail: `Expired on: ${expiryDateStr}`,
-              memberData
-            });
             setTimeout(() => {
               setAttendanceStatus('idle');
+              setMatchedMember(null);
+              setDetection(null);
               freezeRef.current = false;
-            }, 5000);
+              isBusyRef.current = false;
+            }, 3500);
             return;
           }
-        }
 
-        // Check 3: Pending Dues
-        if (memberData.pendingDue && memberData.pendingDue > 0) {
-          freezeRef.current = true;
-          playBuzzerSound();
-          setTimeout(() => speakMessage("Payment due. Please contact reception"), 300);
+          if (res && res.action === 'already_out') {
+            speakMessage(`Already checked out today, ${member.name}`, true);
+            setAttendanceStatus('already_out');
+            setStatusMessage('Already Checked Out Today');
 
-          setAttendanceStatus('denied');
-          setDenialReason({
-            title: 'DUES PENDING',
-            message: 'Please clear your payment',
-            detail: `Outstanding Balance: ₹${memberData.pendingDue}`,
-            memberData
+            setTimeout(() => {
+              setAttendanceStatus('idle');
+              setMatchedMember(null);
+              setDetection(null);
+              freezeRef.current = false;
+              isBusyRef.current = false;
+            }, 3200);
+            return;
+          }
+
+          // Check-Out SUCCESS: Lock screen completely for 4.5 seconds
+          playSuccessChime();
+          speakMessage(`Check-out successful! Goodbye ${member.name}`, true);
+
+          setAttendanceEvent({
+            type: 'check_out',
+            name: member.name,
+            role: member.role || 'Staff',
+            code: member.profile_code,
+            time: formattedTime,
           });
+
+          setAttendanceStatus('checked_out');
+          setStatusMessage('Shift Check-Out Successful! ✓');
+
+          // Keep success screen visible for 4.5 full seconds before releasing
           setTimeout(() => {
             setAttendanceStatus('idle');
+            setAttendanceEvent(null);
+            setMatchedMember(null);
+            setDetection(null);
             freezeRef.current = false;
-          }, 5000);
+            isBusyRef.current = false;
+          }, SUCCESS_DISPLAY_TIME_MS);
           return;
         }
 
-        // Write attendance for member
-        const todayStr = getLocalDateString();
-        await addDoc(collection(db, 'attendance'), {
-          member_id: member.id,
-          attendance_date: todayStr,
-          check_in_time: new Date().toISOString(),
-          attendance_method: 'face_kiosk',
-        });
+        // ================= CHECK-IN LOGIC =================
+        setStatusMessage(`Checking in ${member.name}...`);
+        const duplicateKey = `${member.id}_${getLocalDateString()}`;
 
+        if (todayAttendanceSet.current.has(duplicateKey)) {
+          speakMessage(`Already checked in today, ${member.name}`, true);
+          setAttendanceStatus('already_in');
+          setStatusMessage('Already Checked In Today');
+
+          setTimeout(() => {
+            setAttendanceStatus('idle');
+            setMatchedMember(null);
+            setDetection(null);
+            freezeRef.current = false;
+            isBusyRef.current = false;
+          }, 3200);
+          return;
+        }
+
+        const res = await markAttendance(member.id, 'check_in', 'face_kiosk');
+
+        if (res && res.action === 'already_in') {
+          todayAttendanceSet.current.add(duplicateKey);
+          speakMessage(`Already checked in today, ${member.name}`, true);
+          setAttendanceStatus('already_in');
+          setStatusMessage('Already Checked In Today');
+
+          setTimeout(() => {
+            setAttendanceStatus('idle');
+            setMatchedMember(null);
+            setDetection(null);
+            freezeRef.current = false;
+            isBusyRef.current = false;
+          }, 3200);
+          return;
+        }
+
+        // Check-In SUCCESS: Lock screen completely for 4.5 seconds
         todayAttendanceSet.current.add(duplicateKey);
-
-        freezeRef.current = true;
         playSuccessChime();
-        setTimeout(() => speakMessage("Member Attendance Done"), 300);
+        speakMessage(`Check-in successful! Welcome ${member.name}`, true);
+
+        setAttendanceEvent({
+          type: 'check_in',
+          name: member.name,
+          role: member.role || 'Staff',
+          code: member.profile_code,
+          time: formattedTime,
+        });
 
         setAttendanceStatus('checked_in');
         setStatusMessage('Check-In Successful! ✓');
+
+        // Keep success screen visible for 4.5 full seconds before releasing
         setTimeout(() => {
           setAttendanceStatus('idle');
+          setAttendanceEvent(null);
+          setMatchedMember(null);
+          setDetection(null);
           freezeRef.current = false;
+          isBusyRef.current = false;
+        }, SUCCESS_DISPLAY_TIME_MS);
+      } catch (err) {
+        console.error('[Attendance] API error:', err);
+        setAttendanceStatus('no_match');
+        setStatusMessage(`Error: ${err.message}`);
+        setTimeout(() => {
+          setAttendanceStatus('idle');
+          setMatchedMember(null);
+          setDetection(null);
+          freezeRef.current = false;
+          isBusyRef.current = false;
         }, 3000);
       }
+    },
+    [kioskMode, playBuzzerSound, playSuccessChime, speakMessage]
+  );
 
-    } catch (err) {
-      console.error('[Attendance] Firebase error:', err);
-      setAttendanceStatus('no_match');
-      setStatusMessage(`Attendance error: ${err.message}`);
-    }
-  }, [playBuzzerSound, playSuccessChime, speakMessage]);
-
-  function handleStopCamera() {
+  const handleStopCamera = () => {
     stopCamera();
     setCameraActive(false);
     setDetection(null);
     setMatchedMember(null);
     setAttendanceStatus('idle');
     setStatusMessage('Camera stopped.');
-  }
+  };
 
-  function handleRefresh() {
+  const handleRefresh = () => {
     setDetection(null);
     setMatchedMember(null);
     setAttendanceStatus('idle');
-    setStatusMessage('Refreshing face data...');
+    setStatusMessage('Refreshing staff data...');
     loadDescriptors();
-  }
+  };
 
-  // Model loading
   if (!modelsLoaded && !modelError) {
-    return <LoadingScreen icon="🤖" message={loadingProgress} />;
+    return <LoadingScreen icon="🐼" message={loadingProgress} />;
   }
   if (modelError) {
     return <LoadingScreen error={modelError} />;
   }
 
   return (
-    <div className="fa-page">
-      {/* Full-screen camera */}
+    <div className={`fa-page ${kioskMode === 'check_out' ? 'mode-checkout-active' : ''}`}>
       <div className="fa-camera-container">
         {cameraActive ? (
           <>
@@ -557,11 +508,11 @@ export default function FaceAttendance() {
               muted
             />
 
-            {/* Face box */}
-            {detection && (
+            {/* Face Box */}
+            {detection && !freezeRef.current && (
               <FaceBox
                 detection={detection}
-                color={boxColor}
+                color={kioskMode === 'check_out' ? '#f43f5e' : boxColor}
                 status={attendanceStatus}
                 videoElement={videoRef.current}
                 width={dimensions.width}
@@ -569,41 +520,123 @@ export default function FaceAttendance() {
               />
             )}
 
-            {/* BIG Overlay for Already Checked In */}
+            {/* Fixed Prominent Header Bar with Mode Switcher */}
+            <div className="fa-top-nav">
+              <button
+                id="btn-fa-back"
+                className="fa-top-btn"
+                onClick={() => {
+                  stopCamera();
+                  navigate('/');
+                }}
+              >
+                ← Home
+              </button>
+
+              {/* Big Prominent Check-In / Check-Out Toggle */}
+              <div className="kiosk-mode-selector">
+                <button
+                  type="button"
+                  className={`kiosk-tab-btn tab-in ${kioskMode === 'check_in' ? 'active' : ''}`}
+                  onClick={() => {
+                    if (freezeRef.current) return;
+                    setKioskMode('check_in');
+                    setStatusMessage('🟢 Check-In Mode Active');
+                  }}
+                >
+                  <span className="tab-icon">🟢</span>
+                  <span className="tab-text">CHECK-IN</span>
+                </button>
+                <button
+                  type="button"
+                  className={`kiosk-tab-btn tab-out ${kioskMode === 'check_out' ? 'active' : ''}`}
+                  onClick={() => {
+                    if (freezeRef.current) return;
+                    setKioskMode('check_out');
+                    setStatusMessage('🔴 Check-Out Mode Active');
+                  }}
+                >
+                  <span className="tab-icon">🔴</span>
+                  <span className="tab-text">CHECK-OUT</span>
+                </button>
+              </div>
+
+              <button
+                id="btn-fa-refresh"
+                className="fa-top-btn"
+                onClick={handleRefresh}
+                title="Refresh staff faces"
+              >
+                🔄 {descriptorCount}
+              </button>
+            </div>
+
+            {/* Big Overlay: Already Checked In */}
             {attendanceStatus === 'already_in' && (
               <div className="fa-big-overlay warning-overlay">
                 <span className="big-icon">⏱️</span>
                 <h1>Already Checked In</h1>
+                <p>Check-in already logged today.</p>
               </div>
             )}
 
-            {/* BIG Overlay for Denied Access */}
-            {attendanceStatus === 'denied' && denialReason && (
+            {/* Big Overlay: Already Checked Out */}
+            {attendanceStatus === 'already_out' && (
+              <div className="fa-big-overlay warning-overlay">
+                <span className="big-icon">🚪</span>
+                <h1>Already Checked Out</h1>
+                <p>Shift departure already logged today.</p>
+              </div>
+            )}
+
+            {/* Big Overlay: Not Checked In Yet */}
+            {attendanceStatus === 'not_checked_in' && (
               <div className="fa-big-overlay danger-overlay">
-                <span className="big-icon">❌</span>
-                <h1>{denialReason.title}</h1>
-                <p className="denial-message">{denialReason.message}</p>
-                <div className="denial-details-box">
-                  <div className="dd-row">
-                    <span>Member:</span> <strong>{denialReason.memberData.name} ({denialReason.memberData.member_code})</strong>
-                  </div>
-                  <div className="dd-row">
-                    <span>Reason:</span> <strong style={{ color: '#ef4444' }}>{denialReason.detail}</strong>
+                <span className="big-icon">⚠️</span>
+                <h1>No Check-In Record</h1>
+                <p>Staff has not checked in today. Please check in first!</p>
+              </div>
+            )}
+
+            {/* Big Overlay: Check-In Successful (Locks for 4.5 seconds) */}
+            {attendanceStatus === 'checked_in' && attendanceEvent && (
+              <div className="fa-big-overlay success-overlay restaurant-theme">
+                <span className="big-icon">🐼</span>
+                <h1 className="welcome-heading">Welcome to Panda Ka Dhaba!</h1>
+                <div className="checked-member-card">
+                  <div className="cm-name">{attendanceEvent.name}</div>
+                  <div className="cm-meta">
+                    <span className="cm-role">{attendanceEvent.role}</span>
+                    <span className="cm-time">⏰ {attendanceEvent.time}</span>
                   </div>
                 </div>
-                <p className="denial-footer">Please contact reception</p>
+                <div className="cm-tag">🟢 Check-In Recorded ✓</div>
+                <div className="hold-progress-bar">
+                  <div className="hold-progress-fill" />
+                </div>
               </div>
             )}
 
-            {/* BIG Overlay for Checked In */}
-            {attendanceStatus === 'checked_in' && (
-              <div className="fa-big-overlay success-overlay">
-                <span className="big-icon">✅</span>
-                <h1>Check-In Successful!</h1>
+            {/* Big Overlay: Check-Out Successful (Locks for 4.5 seconds) */}
+            {attendanceStatus === 'checked_out' && attendanceEvent && (
+              <div className="fa-big-overlay success-overlay checkout-theme">
+                <span className="big-icon">👋</span>
+                <h1 className="welcome-heading checkout">Shift Check-Out Complete!</h1>
+                <div className="checked-member-card checkout-card">
+                  <div className="cm-name">{attendanceEvent.name}</div>
+                  <div className="cm-meta">
+                    <span className="cm-role">{attendanceEvent.role}</span>
+                    <span className="cm-time out">⏰ {attendanceEvent.time}</span>
+                  </div>
+                </div>
+                <div className="cm-tag out">🔴 Shift Departure Logged ✓ See You Tomorrow!</div>
+                <div className="hold-progress-bar">
+                  <div className="hold-progress-fill checkout-fill" />
+                </div>
               </div>
             )}
 
-            {/* Camera error */}
+            {/* Camera Error */}
             {cameraError && (
               <div className="fa-camera-error">
                 <span className="fa-error-icon">📵</span>
@@ -615,7 +648,7 @@ export default function FaceAttendance() {
               </div>
             )}
 
-            {/* Loading */}
+            {/* Loading Faces */}
             {(!isReady || descriptorsLoading) && !cameraError && (
               <div className="fa-loading-overlay">
                 <div className="spinner-ring" />
@@ -623,26 +656,14 @@ export default function FaceAttendance() {
                   {!isReady
                     ? 'Starting camera...'
                     : descriptorsLoading
-                      ? `Loading ${descriptorCount} face profiles...`
-                      : 'Preparing...'}
+                    ? `Loading ${descriptorCount} staff face profiles...`
+                    : 'Ready...'}
                 </p>
               </div>
             )}
 
-            {/* Descriptors error */}
-            {descriptorsError && (
-              <div className="fa-camera-error">
-                <span className="fa-error-icon">⚠️</span>
-                <h3>Face Data Error</h3>
-                <p>{descriptorsError}</p>
-                <button className="fa-btn-accent" onClick={handleRefresh}>
-                  Retry
-                </button>
-              </div>
-            )}
-
-            {/* Scan guides (crosshair) */}
-            {isReady && !descriptorsLoading && !cameraError && !descriptorsError && (
+            {/* Scan Guidelines */}
+            {isReady && !descriptorsLoading && !cameraError && !descriptorsError && !freezeRef.current && (
               <div className="fa-scan-guide">
                 <div className="scan-corner top-left" />
                 <div className="scan-corner top-right" />
@@ -651,71 +672,43 @@ export default function FaceAttendance() {
               </div>
             )}
 
-            {/* Status overlay at bottom */}
+            {/* Bottom Status Overlay */}
             <StatusOverlay
               member={matchedMember}
               status={attendanceStatus}
               statusMessage={statusMessage}
             />
 
-            {/* Top bar */}
-            <div className="fa-top-bar">
-              <button
-                id="btn-fa-back"
-                className="fa-top-btn"
-                onClick={() => {
-                  stopCamera();
-                  navigate('/');
-                }}
-              >
-                ← Back
-              </button>
-
-              <div className="fa-top-center">
-                <span className="fa-scan-badge">
-                  <span className="fa-scan-dot" />
-                  {descriptorCount} Faces Loaded
-                </span>
-              </div>
-
-              <button
-                id="btn-fa-refresh"
-                className="fa-top-btn"
-                onClick={handleRefresh}
-                title="Refresh face data from Firebase"
-              >
-                🔄 Refresh
-              </button>
-            </div>
-
-            {/* Stop camera button */}
+            {/* Stop Camera Button */}
             <button
               id="btn-fa-stop"
               className="fa-stop-btn"
               onClick={handleStopCamera}
             >
-              ⏹ Stop Camera
+              ⏹ Stop
             </button>
           </>
         ) : (
-          /* Camera stopped state */
+          /* Camera Stopped State */
           <div className="fa-stopped">
-            <div className="stopped-icon">⏹</div>
-            <h2 className="stopped-title">Camera Stopped</h2>
-            <p className="stopped-desc">Tap below to resume face attendance scanning.</p>
+            <div className="stopped-icon">🐼</div>
+            <h2 className="stopped-title">Kiosk Idle</h2>
+            <p className="stopped-desc">
+              Panda Ka Dhaba attendance terminal is paused. Tap below to resume.
+            </p>
             <button
               id="btn-fa-resume"
               className="fa-btn-accent"
               onClick={() => {
                 setCameraActive(true);
                 setAttendanceStatus('idle');
-                setStatusMessage('Point camera at your face...');
+                setStatusMessage('Point camera at face...');
               }}
             >
-              ▶ Resume Camera
+              ▶ Resume Face Kiosk
             </button>
             <button className="fa-btn-secondary" onClick={() => navigate('/')}>
-              ← Go Home
+              ← Go to Dashboard
             </button>
           </div>
         )}

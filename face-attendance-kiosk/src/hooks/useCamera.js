@@ -23,6 +23,14 @@ export function useCamera(active = true, facingMode = 'user') {
       setIsReady(false);
       setError(null);
 
+      // Check if mediaDevices is supported (requires HTTPS on mobile browsers)
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        setError(
+          'Camera access requires HTTPS on mobile devices. Please open via https:// or run as an Android APK.'
+        );
+        return;
+      }
+
       try {
         const mediaStream = await navigator.mediaDevices.getUserMedia({
           video: {
@@ -43,11 +51,11 @@ export function useCamera(active = true, facingMode = 'user') {
         if (cancelled) return;
 
         if (err.name === 'NotAllowedError' || err.name === 'PermissionDeniedError') {
-          setError('Camera permission denied. Please allow camera access in your browser settings.');
+          setError('Camera permission denied. Please allow camera access in your browser/device settings.');
         } else if (err.name === 'NotFoundError' || err.name === 'DevicesNotFoundError') {
           setError('No camera found. Please connect a camera and try again.');
         } else if (err.name === 'NotReadableError') {
-          setError('Camera is already in use by another app. Please close it and retry.');
+          setError('Camera is in use by another app. Please close other camera apps and retry.');
         } else {
           setError(`Camera error: ${err.message}`);
         }
@@ -76,17 +84,16 @@ export function useCamera(active = true, facingMode = 'user') {
     videoElement.srcObject = stream;
 
     const handleLoadedMetadata = () => {
-      videoElement.play().catch(e => console.warn('Autoplay prevented:', e));
+      videoElement.play().catch((e) => console.warn('Autoplay prevented:', e));
       setIsReady(true);
     };
 
     videoElement.addEventListener('loadedmetadata', handleLoadedMetadata);
 
-    // Fallback in case 'loadedmetadata' never fires (common on some mobile browsers)
     const fallbackTimer = setTimeout(() => {
-      videoElement.play().catch(e => console.warn('Autoplay prevented on fallback:', e));
+      videoElement.play().catch((e) => console.warn('Autoplay fallback prevented:', e));
       setIsReady(true);
-    }, 1500);
+    }, 1200);
 
     return () => {
       videoElement.removeEventListener('loadedmetadata', handleLoadedMetadata);
@@ -98,12 +105,9 @@ export function useCamera(active = true, facingMode = 'user') {
     if (stream) {
       stream.getTracks().forEach((t) => t.stop());
       setStream(null);
+      setIsReady(false);
     }
-    if (videoRef.current) {
-      videoRef.current.srcObject = null;
-    }
-    setIsReady(false);
   }
 
-  return { videoRef, isReady, error, stopCamera };
+  return { videoRef, stream, isReady, error, stopCamera };
 }

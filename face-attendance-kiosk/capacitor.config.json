@@ -1,5 +1,5 @@
 {
-  "appId": "com.facekioska.app",
-  "appName": "face-attendance-kiosk",
+  "appId": "com.pandagroup.attendance",
+  "appName": "Panda Group",
   "webDir": "dist"
 }

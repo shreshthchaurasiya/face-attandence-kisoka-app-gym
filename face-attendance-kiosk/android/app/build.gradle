@@ -1,10 +1,10 @@
 apply plugin: 'com.android.application'
 
 android {
-    namespace = "com.facekioska.app"
+    namespace = "com.pandagroup.attendance"
     compileSdk = rootProject.ext.compileSdkVersion
     defaultConfig {
-        applicationId "com.facekioska.app"
+        applicationId "com.pandagroup.attendance"
         minSdkVersion rootProject.ext.minSdkVersion
         targetSdkVersion rootProject.ext.targetSdkVersion
         versionCode 1
